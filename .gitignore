@@ -1,4 +1,4 @@
-﻿[Bb]in/
+[Bb]in/
 [Oo]bj/
 
 *.rsuser
@@ -8,7 +8,6 @@
 *.sln.docstates
 
 .vs/
-.vscode/
 .idea/
 
 .DS_Store
