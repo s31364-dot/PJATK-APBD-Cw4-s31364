@@ -4,6 +4,43 @@ namespace LegacyRenewalApp
 {
     public class SubscriptionRenewalService
     {
+        private readonly ICustomerRepository _customerRepository;
+        private readonly ISubscriptionPlanRepository _planRepository;
+        private readonly ILegacyBillingAdapter _billingAdapter;
+        private readonly IDiscountCalculator _discountCalculator;
+        private readonly ISupportFeeCalculator _supportFeeCalculator;
+        private readonly IPaymentFeeCalculator _paymentFeeCalculator;
+        private readonly ITaxCalculator _taxCalculator;
+
+        public SubscriptionRenewalService()
+            : this(new CustomerRepository(), 
+                   new SubscriptionPlanRepository(), 
+                   new LegacyBillingAdapter(),
+                   new DefaultDiscountCalculator(),
+                   new DefaultSupportFeeCalculator(),
+                   new DefaultPaymentFeeCalculator(),
+                   new DefaultTaxCalculator())
+        {
+        }
+
+        public SubscriptionRenewalService(
+            ICustomerRepository customerRepository,
+            ISubscriptionPlanRepository planRepository,
+            ILegacyBillingAdapter billingAdapter,
+            IDiscountCalculator discountCalculator,
+            ISupportFeeCalculator supportFeeCalculator,
+            IPaymentFeeCalculator paymentFeeCalculator,
+            ITaxCalculator taxCalculator)
+        {
+            _customerRepository = customerRepository;
+            _planRepository = planRepository;
+            _billingAdapter = billingAdapter;
+            _discountCalculator = discountCalculator;
+            _supportFeeCalculator = supportFeeCalculator;
+            _paymentFeeCalculator = paymentFeeCalculator;
+            _taxCalculator = taxCalculator;
+        }
+
         public RenewalInvoice CreateRenewalInvoice(
             int customerId,
             string planCode,
@@ -12,34 +49,13 @@ namespace LegacyRenewalApp
             bool includePremiumSupport,
             bool useLoyaltyPoints)
         {
-            if (customerId <= 0)
-            {
-                throw new ArgumentException("Customer id must be positive");
-            }
-
-            if (string.IsNullOrWhiteSpace(planCode))
-            {
-                throw new ArgumentException("Plan code is required");
-            }
-
-            if (seatCount <= 0)
-            {
-                throw new ArgumentException("Seat count must be positive");
-            }
-
-            if (string.IsNullOrWhiteSpace(paymentMethod))
-            {
-                throw new ArgumentException("Payment method is required");
-            }
+            ValidateInputs(customerId, planCode, seatCount, paymentMethod);
 
             string normalizedPlanCode = planCode.Trim().ToUpperInvariant();
             string normalizedPaymentMethod = paymentMethod.Trim().ToUpperInvariant();
 
-            var customerRepository = new CustomerRepository();
-            var planRepository = new SubscriptionPlanRepository();
-
-            var customer = customerRepository.GetById(customerId);
-            var plan = planRepository.GetByCode(normalizedPlanCode);
+            var customer = _customerRepository.GetById(customerId);
+            var plan = _planRepository.GetByCode(normalizedPlanCode);
 
             if (!customer.IsActive)
             {
@@ -47,150 +63,60 @@ namespace LegacyRenewalApp
             }
 
             decimal baseAmount = (plan.MonthlyPricePerSeat * seatCount * 12m) + plan.SetupFee;
-            decimal discountAmount = 0m;
-            string notes = string.Empty;
+            string finalNotes = string.Empty;
 
-            if (customer.Segment == "Silver")
-            {
-                discountAmount += baseAmount * 0.05m;
-                notes += "silver discount; ";
-            }
-            else if (customer.Segment == "Gold")
-            {
-                discountAmount += baseAmount * 0.10m;
-                notes += "gold discount; ";
-            }
-            else if (customer.Segment == "Platinum")
-            {
-                discountAmount += baseAmount * 0.15m;
-                notes += "platinum discount; ";
-            }
-            else if (customer.Segment == "Education" && plan.IsEducationEligible)
-            {
-                discountAmount += baseAmount * 0.20m;
-                notes += "education discount; ";
-            }
+            var discountResult = _discountCalculator.Calculate(customer, plan, baseAmount, seatCount, useLoyaltyPoints);
+            finalNotes += discountResult.Notes;
 
-            if (customer.YearsWithCompany >= 5)
-            {
-                discountAmount += baseAmount * 0.07m;
-                notes += "long-term loyalty discount; ";
-            }
-            else if (customer.YearsWithCompany >= 2)
-            {
-                discountAmount += baseAmount * 0.03m;
-                notes += "basic loyalty discount; ";
-            }
-
-            if (seatCount >= 50)
-            {
-                discountAmount += baseAmount * 0.12m;
-                notes += "large team discount; ";
-            }
-            else if (seatCount >= 20)
-            {
-                discountAmount += baseAmount * 0.08m;
-                notes += "medium team discount; ";
-            }
-            else if (seatCount >= 10)
-            {
-                discountAmount += baseAmount * 0.04m;
-                notes += "small team discount; ";
-            }
-
-            if (useLoyaltyPoints && customer.LoyaltyPoints > 0)
-            {
-                int pointsToUse = customer.LoyaltyPoints > 200 ? 200 : customer.LoyaltyPoints;
-                discountAmount += pointsToUse;
-                notes += $"loyalty points used: {pointsToUse}; ";
-            }
-
-            decimal subtotalAfterDiscount = baseAmount - discountAmount;
+            decimal subtotalAfterDiscount = baseAmount - discountResult.Amount;
             if (subtotalAfterDiscount < 300m)
             {
                 subtotalAfterDiscount = 300m;
-                notes += "minimum discounted subtotal applied; ";
+                finalNotes += "minimum discounted subtotal applied; ";
             }
 
-            decimal supportFee = 0m;
-            if (includePremiumSupport)
-            {
-                if (normalizedPlanCode == "START")
-                {
-                    supportFee = 250m;
-                }
-                else if (normalizedPlanCode == "PRO")
-                {
-                    supportFee = 400m;
-                }
-                else if (normalizedPlanCode == "ENTERPRISE")
-                {
-                    supportFee = 700m;
-                }
+            var supportResult = _supportFeeCalculator.Calculate(normalizedPlanCode, includePremiumSupport);
+            finalNotes += supportResult.Notes;
 
-                notes += "premium support included; ";
-            }
+            decimal amountForPaymentFee = subtotalAfterDiscount + supportResult.Amount;
+            var paymentResult = _paymentFeeCalculator.Calculate(normalizedPaymentMethod, amountForPaymentFee);
+            finalNotes += paymentResult.Notes;
 
-            decimal paymentFee = 0m;
-            if (normalizedPaymentMethod == "CARD")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.02m;
-                notes += "card payment fee; ";
-            }
-            else if (normalizedPaymentMethod == "BANK_TRANSFER")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.01m;
-                notes += "bank transfer fee; ";
-            }
-            else if (normalizedPaymentMethod == "PAYPAL")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.035m;
-                notes += "paypal fee; ";
-            }
-            else if (normalizedPaymentMethod == "INVOICE")
-            {
-                paymentFee = 0m;
-                notes += "invoice payment; ";
-            }
-            else
-            {
-                throw new ArgumentException("Unsupported payment method");
-            }
-
-            decimal taxRate = 0.20m;
-            if (customer.Country == "Poland")
-            {
-                taxRate = 0.23m;
-            }
-            else if (customer.Country == "Germany")
-            {
-                taxRate = 0.19m;
-            }
-            else if (customer.Country == "Czech Republic")
-            {
-                taxRate = 0.21m;
-            }
-            else if (customer.Country == "Norway")
-            {
-                taxRate = 0.25m;
-            }
-
-            decimal taxBase = subtotalAfterDiscount + supportFee + paymentFee;
+            decimal taxRate = _taxCalculator.GetTaxRate(customer.Country);
+            decimal taxBase = amountForPaymentFee + paymentResult.Amount;
             decimal taxAmount = taxBase * taxRate;
             decimal finalAmount = taxBase + taxAmount;
 
             if (finalAmount < 500m)
             {
                 finalAmount = 500m;
-                notes += "minimum invoice amount applied; ";
+                finalNotes += "minimum invoice amount applied; ";
             }
 
-            var invoice = new RenewalInvoice
+            var invoice = BuildInvoice(customerId, normalizedPlanCode, normalizedPaymentMethod, seatCount, customer.FullName, baseAmount, discountResult.Amount, supportResult.Amount, paymentResult.Amount, taxAmount, finalAmount, finalNotes);
+
+            _billingAdapter.SaveInvoice(invoice);
+            SendNotification(customer, normalizedPlanCode, invoice.FinalAmount);
+
+            return invoice;
+        }
+
+        private void ValidateInputs(int customerId, string planCode, int seatCount, string paymentMethod)
+        {
+            if (customerId <= 0) throw new ArgumentException("Customer id must be positive");
+            if (string.IsNullOrWhiteSpace(planCode)) throw new ArgumentException("Plan code is required");
+            if (seatCount <= 0) throw new ArgumentException("Seat count must be positive");
+            if (string.IsNullOrWhiteSpace(paymentMethod)) throw new ArgumentException("Payment method is required");
+        }
+
+        private RenewalInvoice BuildInvoice(int customerId, string planCode, string paymentMethod, int seatCount, string customerName, decimal baseAmount, decimal discountAmount, decimal supportFee, decimal paymentFee, decimal taxAmount, decimal finalAmount, string notes)
+        {
+            return new RenewalInvoice
             {
-                InvoiceNumber = $"INV-{DateTime.UtcNow:yyyyMMdd}-{customerId}-{normalizedPlanCode}",
-                CustomerName = customer.FullName,
-                PlanCode = normalizedPlanCode,
-                PaymentMethod = normalizedPaymentMethod,
+                InvoiceNumber = $"INV-{DateTime.UtcNow:yyyyMMdd}-{customerId}-{planCode}",
+                CustomerName = customerName,
+                PlanCode = planCode,
+                PaymentMethod = paymentMethod,
                 SeatCount = seatCount,
                 BaseAmount = Math.Round(baseAmount, 2, MidpointRounding.AwayFromZero),
                 DiscountAmount = Math.Round(discountAmount, 2, MidpointRounding.AwayFromZero),
@@ -201,20 +127,15 @@ namespace LegacyRenewalApp
                 Notes = notes.Trim(),
                 GeneratedAt = DateTime.UtcNow
             };
+        }
 
-            LegacyBillingGateway.SaveInvoice(invoice);
+        private void SendNotification(Customer customer, string planCode, decimal finalAmount)
+        {
+            if (string.IsNullOrWhiteSpace(customer.Email)) return;
 
-            if (!string.IsNullOrWhiteSpace(customer.Email))
-            {
-                string subject = "Subscription renewal invoice";
-                string body =
-                    $"Hello {customer.FullName}, your renewal for plan {normalizedPlanCode} " +
-                    $"has been prepared. Final amount: {invoice.FinalAmount:F2}.";
-
-                LegacyBillingGateway.SendEmail(customer.Email, subject, body);
-            }
-
-            return invoice;
+            string subject = "Subscription renewal invoice";
+            string body = $"Hello {customer.FullName}, your renewal for plan {planCode} has been prepared. Final amount: {finalAmount:F2}.";
+            _billingAdapter.SendEmail(customer.Email, subject, body);
         }
     }
 }
